@@ -1,23 +1,20 @@
-import express from "express";
-import cors from "cors";
-import { createClient } from "@supabase/supabase-js";
-import multer from "multer";
-import path from "path";
-import { fileURLToPath } from "url";
-import fs from "fs";
-import bcrypt from "bcryptjs";
-import crypto from "crypto";
+// server.js (CommonJS version)
+const express = require("express");
+const cors = require("cors");
+const { createClient } = require("@supabase/supabase-js");
+const multer = require("multer");
+const path = require("path");
+const fs = require("fs");
+const bcrypt = require("bcryptjs");
+const crypto = require("crypto");
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// For ES modules, we need to define __dirname
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
+// For CommonJS, we can use __dirname directly
 // Create uploads directory if it doesn't exist
-const uploadsDir = path.join(__dirname, 'uploads');
+const uploadsDir = path.join(__dirname, '..', 'uploads');
 if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
