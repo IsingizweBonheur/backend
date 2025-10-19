@@ -1,4 +1,4 @@
-// server.js (CommonJS version)
+
 const express = require("express");
 const cors = require("cors");
 const { createClient } = require("@supabase/supabase-js");
@@ -7,7 +7,6 @@ const path = require("path");
 const fs = require("fs");
 const bcrypt = require("bcryptjs");
 const crypto = require("crypto");
-
 const app = express();
 app.use(cors());
 app.use(express.json());
