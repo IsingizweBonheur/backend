@@ -402,6 +402,7 @@ const verifyUser = async (req, res, next) => {
       .eq("email", user.email)
       .single();
 
+
     req.user = userData;
     next();
   } catch (error) {
