@@ -7,7 +7,6 @@ const fs = require("fs");
 const bcrypt = require("bcryptjs");
 const crypto = require("crypto");
 require("dotenv").config();
-
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -378,21 +377,36 @@ app.post("/api/auth/validate-reset-token", async (req, res) => {
   }
 });
 
-// FIXED: Improved middleware to verify user (simple session-based auth)
+// FIXED: Improved middleware to verify user (works with Supabase auth)
 const verifyUser = async (req, res, next) => {
   try {
-    const userId = req.headers['user-id'];
-    const userEmail = req.headers['user-email'];
-    // Verify user exists
-    const { data: user, error } = await supabase
+    const authHeader = req.headers.authorization;
+    
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ message: "Authentication required" });
+    }
+
+    const token = authHeader.substring(7);
+    
+    // Verify Supabase token
+    const { data: { user }, error } = await supabase.auth.getUser(token);
+    
+    if (error || !user) {
+      return res.status(401).json({ message: "Invalid authentication token" });
+    }
+
+    // Get user details from database
+    const { data: userData, error: userError } = await supabase
       .from("users")
-      .select("id, email, username")
-      .eq("id", userId)
-      .eq("email", userEmail)
+      .select("id, email, username, role")
+      .eq("email", user.email)
       .single();
 
+    if (userError || !userData) {
+      return res.status(401).json({ message: "User not found" });
+    }
 
-    req.user = user;
+    req.user = userData;
     next();
   } catch (error) {
     console.error("Auth middleware error:", error);
@@ -443,7 +457,7 @@ app.put("/api/auth/profile", verifyUser, async (req, res) => {
   }
 });
 
-// FIXED: Improved user orders endpoint with better error handling
+// FIXED: Improved user orders endpoint with proper authentication
 app.get("/api/orders/user", verifyUser, async (req, res) => {
   try {
     const user = req.user;
@@ -668,31 +682,60 @@ app.get("/api/orders/:orderId/items", verifyUser, async (req, res) => {
   }
 });
 
-// Update order status (protected)
+// ✅ Update order status (protected route)
+// ✅ Update order status (protected, UUID-safe)
 app.put("/api/orders/:orderId", verifyUser, async (req, res) => {
   try {
     const { orderId } = req.params;
     const { status } = req.body;
 
-    if (!['pending', 'completed', 'cancelled'].includes(status)) {
-      return res.status(400).json({ message: "Invalid status" });
+    // ✅ Validate input
+    const allowedStatuses = ["pending", "completed", "cancelled"];
+    if (!allowedStatuses.includes(status)) {
+      return res.status(400).json({ message: "Invalid status value" });
     }
 
-    const { error } = await supabase
-      .from("orders")
-      .update({ 
-        status, 
-        updated_at: new Date().toISOString()
-      })
-      .eq('id', orderId);
+    if (!orderId) {
+      return res.status(400).json({ message: "Missing order ID" });
+    }
 
-    if (error) throw error;
-    res.json({ message: "Order status updated successfully" });
+    // ✅ Update by UUID (no parseInt!)
+    const { data, error } = await supabase
+      .from("orders")
+      .update({ status })
+      .eq("id", orderId)
+      .select("*")
+      .single(); // ensures a single object, not array
+
+    if (error) {
+      console.error("❌ Supabase update error:", error);
+      return res.status(400).json({
+        message: "Supabase update failed",
+        error: error.message,
+      });
+    }
+
+    if (!data) {
+      return res.status(404).json({ message: "Order not found" });
+    }
+
+    console.log("✅ Order status updated successfully:", data);
+
+    res.status(200).json({
+      message: "Order status updated successfully",
+      order: data,
+    });
   } catch (error) {
-    console.error("Error updating order:", error);
-    res.status(500).json({ message: "Failed to update order", error: error.message });
+    console.error("❌ Unexpected error updating order:", error);
+    res.status(500).json({
+      message: "Failed to update order",
+      error: error.message,
+    });
   }
 });
+;
+
+
 
 // Delete order (protected)
 app.delete("/api/orders/:orderId", verifyUser, async (req, res) => {
@@ -1043,16 +1086,7 @@ app.get("/", (req, res) => {
   res.json({ message: "Fast Food API is running!" });
 });
 
-// Error handling middleware
-app.use((error, req, res, next) => {
-  console.error('Unhandled error:', error);
-  res.status(500).json({ 
-    message: 'Internal server error',
-    error: process.env.NODE_ENV === 'development' ? error.message : undefined
-  });
-});
 
-// 404 handler
 // Error handling middleware
 app.use((error, req, res, next) => {
   console.error('Unhandled error:', error);
