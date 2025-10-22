@@ -10,7 +10,7 @@ require("dotenv").config();
 const app = express();
 
 app.use(cors({
-  origin: ['http://localhost:3000', 'http://127.0.0.1:3000', 'https://backend-wgm2.onrender.com'],
+  origin: ['http://localhost:3000', 'http://127.0.0.1:3000', https://quickfastfood.vercel.app/],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'user-id', 'user-email']
