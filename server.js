@@ -402,10 +402,6 @@ const verifyUser = async (req, res, next) => {
       .eq("email", user.email)
       .single();
 
-    if (userError || !userData) {
-      return res.status(401).json({ message: "User not found" });
-    }
-
     req.user = userData;
     next();
   } catch (error) {
