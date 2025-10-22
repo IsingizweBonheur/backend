@@ -9,7 +9,11 @@ const crypto = require("crypto");
 require("dotenv").config();
 
 const app = express();
-app.use(cors());
+const cors = require("cors");
+app.use(cors({
+  origin: "https://quickfastfood.vercel.app"
+}));
+
 app.use(express.json());
 
 // For Render deployment, use local uploads directory
