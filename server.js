@@ -8,7 +8,13 @@ const bcrypt = require("bcryptjs");
 const crypto = require("crypto");
 require("dotenv").config();
 const app = express();
-app.use(cors());
+
+app.use(cors({
+  origin: ['http://localhost:3000', 'http://127.0.0.1:3000', 'https://backend-wgm2.onrender.com'],
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'user-id', 'user-email']
+}));
 app.use(express.json());
 
 // For Render deployment, use local uploads directory
