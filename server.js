@@ -1,19 +1,19 @@
-
-const express = require("express");
-const cors = require("cors");
+const express = require('express');
+const cors = require('cors');
 const { createClient } = require("@supabase/supabase-js");
 const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
 const bcrypt = require("bcryptjs");
 const crypto = require("crypto");
+require("dotenv").config();
+
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// For CommonJS, we can use __dirname directly
-// Create uploads directory if it doesn't exist
-const uploadsDir = path.join(__dirname, '..', 'uploads');
+// For Render deployment, use local uploads directory
+const uploadsDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
@@ -21,7 +21,7 @@ if (!fs.existsSync(uploadsDir)) {
 // Multer configuration for file uploads
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
-    cb(null, 'uploads/');
+    cb(null, uploadsDir);
   },
   filename: (req, file, cb) => {
     const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
@@ -47,15 +47,39 @@ const upload = multer({
 });
 
 // Supabase client
-const supabaseUrl = "https://kuxrbtxmiwjuabxfbqfx.supabase.co";
-const supabaseServiceKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imt1eHJidHhtaXdqdWFieGZicWZ4Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2MDU2MzIyMiwiZXhwIjoyMDc2MTM5MjIyfQ.zEr3hqQU971UBFyacKqOMZeoVIWIyTSc6obuRlgE-vc";
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+if (!supabaseUrl || !supabaseServiceKey) {
+  console.error('Missing Supabase environment variables');
+  process.exit(1);
+}
+
 const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
 // Serve static files from uploads directory
-app.use('/uploads', express.static('uploads'));
+app.use('/uploads', express.static(uploadsDir));
 
-// In-memory store for password reset tokens (in production, use Redis or database)
+// In-memory store for password reset tokens with automatic cleanup
 const passwordResetTokens = new Map();
+
+// Token cleanup function
+const cleanupExpiredTokens = () => {
+  const now = new Date();
+  let cleanedCount = 0;
+  for (const [token, data] of passwordResetTokens.entries()) {
+    if (now > data.expiresAt) {
+      passwordResetTokens.delete(token);
+      cleanedCount++;
+    }
+  }
+  if (cleanedCount > 0) {
+    console.log(`Cleaned up ${cleanedCount} expired tokens`);
+  }
+};
+
+// Run cleanup every hour
+setInterval(cleanupExpiredTokens, 60 * 60 * 1000);
 
 // User Registration Endpoint
 app.post("/api/auth/register", async (req, res) => {
@@ -158,7 +182,7 @@ app.post("/api/auth/login", async (req, res) => {
   }
 });
 
-// NEW: Check email exists endpoint
+// Check email exists endpoint
 app.post("/api/auth/check-email", async (req, res) => {
   try {
     const { email } = req.body;
@@ -194,7 +218,7 @@ app.post("/api/auth/check-email", async (req, res) => {
   }
 });
 
-// NEW: Forgot Password Endpoint
+// Forgot Password Endpoint
 app.post("/api/auth/forgot-password", async (req, res) => {
   try {
     const { email } = req.body;
@@ -202,6 +226,9 @@ app.post("/api/auth/forgot-password", async (req, res) => {
     if (!email) {
       return res.status(400).json({ message: "Email is required" });
     }
+
+    // Clean up expired tokens first
+    cleanupExpiredTokens();
 
     // Check if user exists
     const { data: user, error } = await supabase
@@ -244,7 +271,7 @@ app.post("/api/auth/forgot-password", async (req, res) => {
   }
 });
 
-// NEW: Reset Password Endpoint
+// Reset Password Endpoint
 app.post("/api/auth/reset-password", async (req, res) => {
   try {
     const { token, newPassword, email } = req.body;
@@ -256,6 +283,9 @@ app.post("/api/auth/reset-password", async (req, res) => {
     if (newPassword.length < 6) {
       return res.status(400).json({ message: "Password must be at least 6 characters" });
     }
+
+    // Clean up expired tokens first
+    cleanupExpiredTokens();
 
     // Verify token exists and is not expired
     const tokenData = passwordResetTokens.get(token);
@@ -302,7 +332,7 @@ app.post("/api/auth/reset-password", async (req, res) => {
   }
 });
 
-// NEW: Validate Reset Token Endpoint
+// Validate Reset Token Endpoint
 app.post("/api/auth/validate-reset-token", async (req, res) => {
   try {
     const { token } = req.body;
@@ -310,6 +340,9 @@ app.post("/api/auth/validate-reset-token", async (req, res) => {
     if (!token) {
       return res.status(400).json({ message: "Token is required" });
     }
+
+    // Clean up expired tokens first
+    cleanupExpiredTokens();
 
     // Verify token exists and is not expired
     const tokenData = passwordResetTokens.get(token);
@@ -345,7 +378,7 @@ app.post("/api/auth/validate-reset-token", async (req, res) => {
   }
 });
 
-// FIXED: Middleware to verify user (simple session-based auth)
+// FIXED: Improved middleware to verify user (simple session-based auth)
 const verifyUser = async (req, res, next) => {
   try {
     const userId = req.headers['user-id'];
@@ -357,6 +390,8 @@ const verifyUser = async (req, res, next) => {
       .eq("id", userId)
       .eq("email", userEmail)
       .single();
+
+
     req.user = user;
     next();
   } catch (error) {
@@ -408,7 +443,7 @@ app.put("/api/auth/profile", verifyUser, async (req, res) => {
   }
 });
 
-// FIXED: Get user orders by email and username (protected) - Added verifyUser middleware
+// FIXED: Improved user orders endpoint with better error handling
 app.get("/api/orders/user", verifyUser, async (req, res) => {
   try {
     const user = req.user;
@@ -432,47 +467,60 @@ app.get("/api/orders/user", verifyUser, async (req, res) => {
     // Get order items for each order
     const ordersWithItems = await Promise.all(
       (orders || []).map(async (order) => {
-        const { data: items, error: itemsError } = await supabase
-          .from("order_items")
-          .select(`
-            *,
-            products:product_id (
-              product_name,
-              description,
-              image_url,
-              total_amount
-            )
-          `)
-          .eq('order_id', order.id);
+        try {
+          const { data: items, error: itemsError } = await supabase
+            .from("order_items")
+            .select(`
+              *,
+              products:product_id (
+                product_name,
+                description,
+                image_url,
+                total_amount
+              )
+            `)
+            .eq('order_id', order.id);
 
-        if (itemsError) {
-          console.error('Error fetching items for order', order.id, itemsError);
-          throw itemsError;
+          if (itemsError) {
+            console.error('Error fetching items for order', order.id, itemsError);
+            return {
+              ...order,
+              cart: [],
+              error: 'Failed to load order items'
+            };
+          }
+
+          // Transform items to match frontend format
+          const cart = items.map(item => ({
+            id: item.product_id,
+            product_name: item.products?.product_name || 'Unknown Product',
+            description: item.products?.description || '',
+            image_url: item.products?.image_url || '',
+            total_amount: item.products?.total_amount || item.price,
+            quantity: item.quantity,
+            price: item.price
+          }));
+
+          return {
+            id: order.id,
+            customer_name: order.customer_name,
+            customer_phone: order.customer_phone,
+            customer_address: order.customer_address,
+            customer_email: order.customer_email,
+            total: order.total_amount,
+            status: order.status,
+            created_at: order.created_at,
+            updated_at: order.updated_at,
+            cart: cart
+          };
+        } catch (itemError) {
+          console.error('Error processing order items for order', order.id, itemError);
+          return {
+            ...order,
+            cart: [],
+            error: 'Failed to process order items'
+          };
         }
-
-        // Transform items to match frontend format
-        const cart = items.map(item => ({
-          id: item.product_id,
-          product_name: item.products?.product_name || 'Unknown Product',
-          description: item.products?.description || '',
-          image_url: item.products?.image_url || '',
-          total_amount: item.products?.total_amount || item.price,
-          quantity: item.quantity,
-          price: item.price
-        }));
-
-        return {
-          id: order.id,
-          customer_name: order.customer_name,
-          customer_phone: order.customer_phone,
-          customer_address: order.customer_address,
-          customer_email: order.customer_email,
-          total: order.total_amount,
-          status: order.status,
-          created_at: order.created_at,
-          updated_at: order.updated_at,
-          cart: cart
-        };
       })
     );
 
@@ -513,7 +561,7 @@ app.post("/api/orders", async (req, res) => {
       order_id: orderId,
       product_id: item.id,
       quantity: item.quantity,
-      price: item.total_amount,
+      price: item.total_amount || item.price, // Handle both naming conventions
     }));
 
     const { error: itemsError } = await supabase.from("order_items").insert(orderItems);
@@ -527,7 +575,6 @@ app.post("/api/orders", async (req, res) => {
   }
 });
 
-// ALL YOUR EXISTING ENDPOINTS BELOW (unchanged)
 // Upload image endpoint (protected)
 app.post("/api/upload", verifyUser, upload.single('image'), async (req, res) => {
   try {
@@ -574,7 +621,7 @@ app.get("/api/orders", verifyUser, async (req, res) => {
     const { data: orders, error } = await supabase
       .from("orders")
       .select("*")
-      .order('id');
+      .order('id', { ascending: false });
 
     if (error) throw error;
     res.json(orders || []);
@@ -635,6 +682,7 @@ app.put("/api/orders/:orderId", verifyUser, async (req, res) => {
       .from("orders")
       .update({ 
         status, 
+        updated_at: new Date().toISOString()
       })
       .eq('id', orderId);
 
@@ -873,6 +921,7 @@ const validateImageUrl = (url) => {
     return null;
   }
 };
+
 // Admin Management Endpoints
 
 // Get all admins (protected)
@@ -890,8 +939,6 @@ app.get("/api/admins", verifyUser, async (req, res) => {
     res.status(500).json({ message: "Failed to fetch admins", error: error.message });
   }
 });
-
-// In your server.js backend file, add these endpoints:
 
 // Create new admin (protected)
 app.post("/api/admins", verifyUser, async (req, res) => {
@@ -934,6 +981,7 @@ app.post("/api/admins", verifyUser, async (req, res) => {
       ])
       .select()
       .single();
+
     if (createError) {
       console.error("Admin creation error:", createError);
       return res.status(500).json({ message: "Failed to create admin" });
@@ -984,7 +1032,42 @@ app.delete("/api/admins/:adminId", verifyUser, async (req, res) => {
     res.status(500).json({ message: "Failed to delete admin", error: error.message });
   }
 });
+
 // Health check endpoint
 app.get("/api/health", (req, res) => {
   res.json({ status: "OK", message: "Server is running" });
+});
+
+// Root endpoint
+app.get("/", (req, res) => {
+  res.json({ message: "Fast Food API is running!" });
+});
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ 
+    message: 'Internal server error',
+    error: process.env.NODE_ENV === 'development' ? error.message : undefined
+  });
+});
+
+// 404 handler
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ 
+    message: 'Internal server error',
+    error: process.env.NODE_ENV === 'development' ? error.message : undefined
+  });
+});
+
+// 404 handler - FIXED VERSION
+app.use((req, res, next) => {
+  res.status(404).json({ message: 'Endpoint not found' });
+});
+
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 });
