@@ -12,7 +12,7 @@ const app = express();
 
 // ✅ FIXED: Single CORS configuration
 app.use(cors({
-  origin: ["https://quickfastfood.vercel.app", "http://localhost:3000"],
+  origin: ["https://quickfastfood.vercel.app"],
   credentials: true
 }));
 
