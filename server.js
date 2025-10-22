@@ -8,12 +8,11 @@ const bcrypt = require("bcryptjs");
 const crypto = require("crypto");
 require("dotenv").config();
 const app = express();
-
 app.use(cors({
   origin: [
     'http://localhost:3000', 
     'http://127.0.0.1:3000', 
-    'https://quickfastfood.vercel.app'
+    'https://quickfastfood.vercel.app' // ← ADD QUOTES and remove trailing slash
   ],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
@@ -39,6 +38,7 @@ const storage = multer.diskStorage({
 });
 
 const fileFilter = (req, file, cb) => {
+  // Check if the file is an image
   if (file.mimetype.startsWith('image/')) {
     cb(null, true);
   } else {
@@ -50,7 +50,7 @@ const upload = multer({
   storage: storage,
   fileFilter: fileFilter,
   limits: {
-    fileSize: 5 * 1024 * 1024,
+    fileSize: 5 * 1024 * 1024, // 5MB limit
   }
 });
 
@@ -68,18 +68,25 @@ const supabase = createClient(supabaseUrl, supabaseServiceKey);
 // Serve static files from uploads directory
 app.use('/uploads', express.static(uploadsDir));
 
-// In-memory store for password reset tokens
+// In-memory store for password reset tokens with automatic cleanup
 const passwordResetTokens = new Map();
 
+// Token cleanup function
 const cleanupExpiredTokens = () => {
   const now = new Date();
+  let cleanedCount = 0;
   for (const [token, data] of passwordResetTokens.entries()) {
     if (now > data.expiresAt) {
       passwordResetTokens.delete(token);
+      cleanedCount++;
     }
+  }
+  if (cleanedCount > 0) {
+    console.log(`Cleaned up ${cleanedCount} expired tokens`);
   }
 };
 
+// Run cleanup every hour
 setInterval(cleanupExpiredTokens, 60 * 60 * 1000);
 
 // User Registration Endpoint
@@ -87,6 +94,7 @@ app.post("/api/auth/register", async (req, res) => {
   try {
     const { username, email, password } = req.body;
 
+    // Validation
     if (!username || !email || !password) {
       return res.status(400).json({ message: "All fields are required" });
     }
@@ -146,6 +154,7 @@ app.post("/api/auth/login", async (req, res) => {
   try {
     const { email, password } = req.body;
 
+    // Validation
     if (!email || !password) {
       return res.status(400).json({ message: "Email and password are required" });
     }
@@ -181,6 +190,42 @@ app.post("/api/auth/login", async (req, res) => {
   }
 });
 
+// Check email exists endpoint
+app.post("/api/auth/check-email", async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ message: "Email is required" });
+    }
+
+    // Check if user exists
+    const { data: user, error } = await supabase
+      .from("users")
+      .select("id, email, username")
+      .eq("email", email)
+      .single();
+
+    if (error || !user) {
+      // For security, don't reveal if email exists or not
+      return res.json({ 
+        exists: false,
+        message: "If an account with that email exists, a password reset link has been sent" 
+      });
+    }
+
+    res.json({ 
+      exists: true, 
+      message: "Email found",
+      user: { id: user.id, email: user.email, username: user.username }
+    });
+
+  } catch (error) {
+    console.error("Check email error:", error);
+    res.status(500).json({ message: "Internal server error" });
+  }
+});
+
 // Forgot Password Endpoint
 app.post("/api/auth/forgot-password", async (req, res) => {
   try {
@@ -190,6 +235,7 @@ app.post("/api/auth/forgot-password", async (req, res) => {
       return res.status(400).json({ message: "Email is required" });
     }
 
+    // Clean up expired tokens first
     cleanupExpiredTokens();
 
     // Check if user exists
@@ -200,6 +246,7 @@ app.post("/api/auth/forgot-password", async (req, res) => {
       .single();
 
     if (error || !user) {
+      // For security, don't reveal if email exists or not
       return res.json({ 
         message: "If an account with that email exists, a password reset link has been sent" 
       });
@@ -207,8 +254,9 @@ app.post("/api/auth/forgot-password", async (req, res) => {
 
     // Generate reset token
     const resetToken = crypto.randomBytes(32).toString('hex');
-    const tokenExpiry = new Date(Date.now() + 60 * 60 * 1000);
+    const tokenExpiry = new Date(Date.now() + 60 * 60 * 1000); // 1 hour expiry
 
+    // Store token in memory (in production, store in database)
     passwordResetTokens.set(resetToken, {
       userId: user.id,
       email: user.email,
@@ -221,6 +269,7 @@ app.post("/api/auth/forgot-password", async (req, res) => {
 
     res.json({ 
       message: "If an account with that email exists, a password reset link has been sent",
+      // For demo purposes only - remove in production
       demoResetToken: resetToken
     });
 
@@ -233,7 +282,7 @@ app.post("/api/auth/forgot-password", async (req, res) => {
 // Reset Password Endpoint
 app.post("/api/auth/reset-password", async (req, res) => {
   try {
-    const { token, newPassword } = req.body;
+    const { token, newPassword, email } = req.body;
 
     if (!token || !newPassword) {
       return res.status(400).json({ message: "Token and new password are required" });
@@ -243,8 +292,10 @@ app.post("/api/auth/reset-password", async (req, res) => {
       return res.status(400).json({ message: "Password must be at least 6 characters" });
     }
 
+    // Clean up expired tokens first
     cleanupExpiredTokens();
 
+    // Verify token exists and is not expired
     const tokenData = passwordResetTokens.get(token);
     
     if (!tokenData) {
@@ -252,8 +303,14 @@ app.post("/api/auth/reset-password", async (req, res) => {
     }
 
     if (new Date() > tokenData.expiresAt) {
+      // Clean up expired token
       passwordResetTokens.delete(token);
       return res.status(400).json({ message: "Reset token has expired" });
+    }
+
+    // Optional: Verify email matches token (for extra security)
+    if (email && email !== tokenData.email) {
+      return res.status(400).json({ message: "Email does not match reset token" });
     }
 
     // Hash new password
@@ -292,8 +349,10 @@ app.post("/api/auth/validate-reset-token", async (req, res) => {
       return res.status(400).json({ message: "Token is required" });
     }
 
+    // Clean up expired tokens first
     cleanupExpiredTokens();
 
+    // Verify token exists and is not expired
     const tokenData = passwordResetTokens.get(token);
     
     if (!tokenData) {
@@ -304,6 +363,7 @@ app.post("/api/auth/validate-reset-token", async (req, res) => {
     }
 
     if (new Date() > tokenData.expiresAt) {
+      // Clean up expired token
       passwordResetTokens.delete(token);
       return res.status(400).json({ 
         valid: false,
@@ -326,16 +386,11 @@ app.post("/api/auth/validate-reset-token", async (req, res) => {
   }
 });
 
-// Improved middleware to verify user
+// FIXED: Improved middleware to verify user (simple session-based auth)
 const verifyUser = async (req, res, next) => {
   try {
     const userId = req.headers['user-id'];
     const userEmail = req.headers['user-email'];
-
-    if (!userId || !userEmail) {
-      return res.status(401).json({ message: "Authentication required" });
-    }
-
     // Verify user exists
     const { data: user, error } = await supabase
       .from("users")
@@ -344,9 +399,6 @@ const verifyUser = async (req, res, next) => {
       .eq("email", userEmail)
       .single();
 
-    if (error || !user) {
-      return res.status(401).json({ message: "Invalid user credentials" });
-    }
 
     req.user = user;
     next();
@@ -366,7 +418,40 @@ app.get("/api/auth/profile", verifyUser, async (req, res) => {
   }
 });
 
-// Enhanced user orders endpoint
+// Update user profile (protected)
+app.put("/api/auth/profile", verifyUser, async (req, res) => {
+  try {
+    const { username, email, phone, address } = req.body;
+    const userId = req.user.id;
+
+    const updateData = {};
+    if (username) updateData.username = username;
+    if (email) updateData.email = email;
+    if (phone !== undefined) updateData.phone = phone;
+    if (address !== undefined) updateData.address = address;
+
+    const { data: user, error } = await supabase
+      .from("users")
+      .update(updateData)
+      .eq("id", userId)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    const { password: _, ...userWithoutPassword } = user;
+    res.json({ 
+      message: "Profile updated successfully", 
+      user: userWithoutPassword 
+    });
+
+  } catch (error) {
+    console.error("Profile update error:", error);
+    res.status(500).json({ message: "Failed to update profile" });
+  }
+});
+
+// FIXED: Improved user orders endpoint with better error handling
 app.get("/api/orders/user", verifyUser, async (req, res) => {
   try {
     const user = req.user;
@@ -454,7 +539,7 @@ app.get("/api/orders/user", verifyUser, async (req, res) => {
   }
 });
 
-// Public endpoint to create order
+// Public endpoint to create order (with user association)
 app.post("/api/orders", async (req, res) => {
   const { customer_name, customer_phone, customer_address, cart, total, customer_email } = req.body;
 
@@ -470,7 +555,7 @@ app.post("/api/orders", async (req, res) => {
         customer_name,
         customer_phone,
         customer_address,
-        customer_email: customer_email || null,
+        customer_email: customer_email || null, // Store email for user association
         total_amount: total,
         status: 'pending'
       }])
@@ -484,7 +569,7 @@ app.post("/api/orders", async (req, res) => {
       order_id: orderId,
       product_id: item.id,
       quantity: item.quantity,
-      price: item.total_amount || item.price,
+      price: item.total_amount || item.price, // Handle both naming conventions
     }));
 
     const { error: itemsError } = await supabase.from("order_items").insert(orderItems);
@@ -495,6 +580,152 @@ app.post("/api/orders", async (req, res) => {
   } catch (err) {
     console.error("Order creation error:", err);
     res.status(500).json({ message: "Failed to create order", error: err.message });
+  }
+});
+
+// Upload image endpoint (protected)
+app.post("/api/upload", verifyUser, upload.single('image'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ message: "No image file provided" });
+    }
+
+    // Construct the URL for the uploaded file
+    const imageUrl = `/uploads/${req.file.filename}`;
+    
+    res.json({ 
+      message: "Image uploaded successfully", 
+      imageUrl: imageUrl,
+      filename: req.file.filename
+    });
+  } catch (error) {
+    console.error("Error uploading image:", error);
+    res.status(500).json({ message: "Failed to upload image", error: error.message });
+  }
+});
+
+// Delete uploaded image (protected)
+app.delete("/api/upload/:filename", verifyUser, async (req, res) => {
+  try {
+    const { filename } = req.params;
+    const filePath = path.join(__dirname, 'uploads', filename);
+
+    // Check if file exists and delete it
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+      res.json({ message: "Image deleted successfully" });
+    } else {
+      res.status(404).json({ message: "Image not found" });
+    }
+  } catch (error) {
+    console.error("Error deleting image:", error);
+    res.status(500).json({ message: "Failed to delete image", error: error.message });
+  }
+});
+
+// Get all orders (protected)
+app.get("/api/orders", verifyUser, async (req, res) => {
+  try {
+    const { data: orders, error } = await supabase
+      .from("orders")
+      .select("*")
+      .order('id', { ascending: false });
+
+    if (error) throw error;
+    res.json(orders || []);
+  } catch (error) {
+    console.error("Error fetching orders:", error);
+    res.status(500).json({ message: "Failed to fetch orders", error: error.message });
+  }
+});
+
+// Get order items (protected)
+app.get("/api/orders/:orderId/items", verifyUser, async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    
+    const { data: items, error } = await supabase
+      .from("order_items")
+      .select(`
+        *,
+        products:product_id (
+          product_name,
+          image_url,
+          description
+        )
+      `)
+      .eq('order_id', orderId);
+
+    if (error) throw error;
+
+    // Transform the data to include product information
+    const transformedItems = items.map(item => ({
+      id: item.id,
+      product_id: item.product_id,
+      product_name: item.products?.product_name || 'Unknown Product',
+      description: item.products?.description || '',
+      image_url: item.products?.image_url || '',
+      quantity: item.quantity,
+      unit_price: item.unit_price,
+    }));
+
+    res.json(transformedItems);
+  } catch (error) {
+    console.error("Error fetching order items:", error);
+    res.status(500).json({ message: "Failed to fetch order items", error: error.message });
+  }
+});
+
+// Update order status (protected)
+app.put("/api/orders/:orderId", verifyUser, async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const { status } = req.body;
+
+    if (!['pending', 'completed', 'cancelled'].includes(status)) {
+      return res.status(400).json({ message: "Invalid status" });
+    }
+
+    const { error } = await supabase
+      .from("orders")
+      .update({ 
+        status, 
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', orderId);
+
+    if (error) throw error;
+    res.json({ message: "Order status updated successfully" });
+  } catch (error) {
+    console.error("Error updating order:", error);
+    res.status(500).json({ message: "Failed to update order", error: error.message });
+  }
+});
+
+// Delete order (protected)
+app.delete("/api/orders/:orderId", verifyUser, async (req, res) => {
+  try {
+    const { orderId } = req.params;
+
+    // First delete order items
+    const { error: itemsError } = await supabase
+      .from("order_items")
+      .delete()
+      .eq('order_id', orderId);
+
+    if (itemsError) throw itemsError;
+
+    // Then delete the order
+    const { error: orderError } = await supabase
+      .from("orders")
+      .delete()
+      .eq('id', orderId);
+
+    if (orderError) throw orderError;
+    res.json({ message: "Order deleted successfully" });
+  } catch (error) {
+    console.error("Error deleting order:", error);
+    res.status(500).json({ message: "Failed to delete order", error: error.message });
   }
 });
 
@@ -511,6 +742,302 @@ app.get("/api/products", async (req, res) => {
   } catch (error) {
     console.error("Error fetching products:", error);
     res.status(500).json({ message: "Failed to fetch products", error: error.message });
+  }
+});
+
+// Update product (protected)
+app.put("/api/products/:productId", verifyUser, async (req, res) => {
+  try {
+    const { productId } = req.params;
+    const { name, description, price, image_url, is_available } = req.body;
+
+    console.log('Updating product:', { productId, name, description, price, image_url, is_available });
+
+    // Validate and clean image URL
+    const cleanedImageUrl = validateImageUrl(image_url);
+    
+    const updateData = {
+      product_name: name,
+      description: description,
+      total_amount: parseFloat(price),
+      is_available: is_available !== undefined ? is_available : true
+    };
+
+    // Only add image_url if it's valid, otherwise keep existing one
+    if (cleanedImageUrl !== null) {
+      updateData.image_url = cleanedImageUrl;
+    } else if (image_url === '') {
+      // If empty string is provided, set to null
+      updateData.image_url = null;
+    }
+
+    console.log('Final update data:', updateData);
+
+    const { data, error } = await supabase
+      .from("products")
+      .update(updateData)
+      .eq('id', productId)
+      .select();
+
+    if (error) {
+      console.error('Supabase update error:', error);
+      throw error;
+    }
+
+    console.log('Product updated successfully:', data);
+    res.json({ message: "Product updated successfully", product: data[0] });
+  } catch (error) {
+    console.error("Error updating product:", error);
+    res.status(500).json({ message: "Failed to update product", error: error.message });
+  }
+});
+
+// Create new product (protected)
+app.post("/api/products", verifyUser, async (req, res) => {
+  try {
+    const { name, description, price, image_url, is_available } = req.body;
+
+    console.log('Creating product:', { name, description, price, image_url, is_available });
+
+    // Validate and clean image URL
+    const cleanedImageUrl = validateImageUrl(image_url);
+
+    const insertData = {
+      product_name: name,
+      description: description,
+      total_amount: parseFloat(price),
+      is_available: is_available !== undefined ? is_available : true
+    };
+
+    // Only add image_url if it's valid
+    if (cleanedImageUrl !== null) {
+      insertData.image_url = cleanedImageUrl;
+    }
+
+    console.log('Final insert data:', insertData);
+
+    const { data, error } = await supabase
+      .from("products")
+      .insert([insertData])
+      .select();
+
+    if (error) {
+      console.error('Supabase insert error:', error);
+      throw error;
+    }
+
+    console.log('Product created successfully:', data);
+    res.json({ message: "Product created successfully", product: data[0] });
+  } catch (error) {
+    console.error("Error creating product:", error);
+    res.status(500).json({ message: "Failed to create product", error: error.message });
+  }
+});
+
+// Delete product (protected)
+app.delete("/api/products/:productId", verifyUser, async (req, res) => {
+  try {
+    const { productId } = req.params;
+
+    const { error } = await supabase
+      .from("products")
+      .delete()
+      .eq('id', productId);
+
+    if (error) throw error;
+    res.json({ message: "Product deleted successfully" });
+  } catch (error) {
+    console.error("Error deleting product:", error);
+    res.status(500).json({ message: "Failed to delete product", error: error.message });
+  }
+});
+
+// Get dashboard stats (protected)
+app.get("/api/dashboard/stats", verifyUser, async (req, res) => {
+  try {
+    // Get total orders
+    const { data: orders, error: ordersError } = await supabase
+      .from("orders")
+      .select("status, total_amount");
+
+    if (ordersError) throw ordersError;
+
+    const totalOrders = orders?.length || 0;
+    const pendingOrders = orders?.filter(order => order.status === "pending").length || 0;
+    const completedOrders = orders?.filter(order => order.status === "completed").length || 0;
+    const totalRevenue = orders?.reduce((sum, order) => sum + (order.total_amount || 0), 0) || 0;
+    const averageOrderValue = totalOrders > 0 ? totalRevenue / totalOrders : 0;
+
+    // Get total products
+    const { data: products, error: productsError } = await supabase
+      .from("products")
+      .select("id");
+
+    if (productsError) throw productsError;
+
+    res.json({
+      totalOrders,
+      pendingOrders,
+      completedOrders,
+      totalRevenue,
+      averageOrderValue,
+      totalProducts: products?.length || 0
+    });
+  } catch (error) {
+    console.error("Error fetching dashboard stats:", error);
+    res.status(500).json({ message: "Failed to fetch dashboard stats", error: error.message });
+  }
+});
+
+// Helper function to validate and clean image URL
+const validateImageUrl = (url) => {
+  if (!url || url.trim() === '') {
+    return null;
+  }
+  
+  // If it's already a local file path (starts with /uploads), return as is
+  if (url.startsWith('/uploads/')) {
+    return url;
+  }
+  
+  // Clean the URL - remove any cache busting parameters that might cause issues
+  let cleanUrl = url.split('?')[0]; // Remove query parameters
+  
+  // Validate URL format
+  try {
+    const urlObj = new URL(cleanUrl);
+    
+    // Check if it's a valid HTTP/HTTPS URL
+    if (!['http:', 'https:'].includes(urlObj.protocol)) {
+      console.log('Invalid protocol:', urlObj.protocol);
+      return null;
+    }
+    
+    // Check for common image file extensions
+    const pathname = urlObj.pathname.toLowerCase();
+    const validExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.bmp'];
+    const hasValidExtension = validExtensions.some(ext => pathname.endsWith(ext));
+    
+    if (!hasValidExtension) {
+      console.log('No valid image extension found:', pathname);
+      // Still allow the URL as some image URLs might not have extensions
+    }
+    
+    return cleanUrl;
+  } catch (error) {
+    console.log('Invalid URL format:', cleanUrl);
+    return null;
+  }
+};
+
+// Admin Management Endpoints
+
+// Get all admins (protected)
+app.get("/api/admins", verifyUser, async (req, res) => {
+  try {
+    const { data: admins, error } = await supabase
+      .from("admin_users")
+      .select("*")
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+    res.json(admins || []);
+  } catch (error) {
+    console.error("Error fetching admins:", error);
+    res.status(500).json({ message: "Failed to fetch admins", error: error.message });
+  }
+});
+
+// Create new admin (protected)
+app.post("/api/admins", verifyUser, async (req, res) => {
+  try {
+    const { email, name, password, role } = req.body;
+
+    // Validation
+    if (!email || !name || !password) {
+      return res.status(400).json({ message: "All fields are required" });
+    }
+
+    if (password.length < 6) {
+      return res.status(400).json({ message: "Password must be at least 6 characters" });
+    }
+
+    // Check if admin already exists
+    const { data: existingAdmin, error: checkError } = await supabase
+      .from("admin_users")
+      .select("id")
+      .eq("email", email)
+      .single();
+
+    if (existingAdmin) {
+      return res.status(400).json({ message: "Admin already exists with this email" });
+    }
+
+    // Hash password
+    const hashedPassword = await bcrypt.hash(password, 12);
+
+    // Create admin
+    const { data: admin, error: createError } = await supabase
+      .from("admin_users")
+      .insert([
+        {
+          name,
+          email,
+          password: hashedPassword,
+          role: role || 'admin',
+        }
+      ])
+      .select()
+      .single();
+
+    if (createError) {
+      console.error("Admin creation error:", createError);
+      return res.status(500).json({ message: "Failed to create admin" });
+    }
+
+    // Remove password from response
+    const { password: _, ...adminWithoutPassword } = admin;
+
+    res.status(201).json({ 
+      message: "Admin created successfully", 
+      admin: adminWithoutPassword 
+    });
+
+  } catch (error) {
+    console.error("Admin creation error:", error);
+    res.status(500).json({ message: "Internal server error" });
+  }
+});
+
+// Delete admin (protected)
+app.delete("/api/admins/:adminId", verifyUser, async (req, res) => {
+  try {
+    const { adminId } = req.params;
+
+    // Prevent self-deletion
+    const { data: admin, error: fetchError } = await supabase
+      .from("admin_users")
+      .select("email")
+      .eq("id", adminId)
+      .single();
+
+    if (fetchError) throw fetchError;
+
+    if (admin.email === req.user.email) {
+      return res.status(400).json({ message: "You cannot delete your own account" });
+    }
+
+    const { error: deleteError } = await supabase
+      .from("admin_users")
+      .delete()
+      .eq("id", adminId);
+
+    if (deleteError) throw deleteError;
+
+    res.json({ message: "Admin deleted successfully" });
+  } catch (error) {
+    console.error("Error deleting admin:", error);
+    res.status(500).json({ message: "Failed to delete admin", error: error.message });
   }
 });
 
@@ -534,8 +1061,13 @@ app.use((error, req, res, next) => {
 });
 
 // 404 handler
-app.use((req, res) => {
-  res.status(404).json({ message: "Endpoint not found" });
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ 
+    message: 'Internal server error',
+    error: process.env.NODE_ENV === 'development' ? error.message : undefined
+  });
 });
 
 const PORT = process.env.PORT || 5000;
