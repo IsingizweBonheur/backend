@@ -1047,29 +1047,8 @@ app.get("/", (req, res) => {
   res.json({ message: "Fast Food API is running!" });
 });
 
-// Error handling middleware
-app.use((error, req, res, next) => {
-  console.error('Unhandled error:', error);
-  res.status(500).json({ 
-    message: 'Internal server error',
-    error: process.env.NODE_ENV === 'development' ? error.message : undefined
-  });
-});
 
-// 404 handler
-// Error handling middleware
-app.use((error, req, res, next) => {
-  console.error('Unhandled error:', error);
-  res.status(500).json({ 
-    message: 'Internal server error',
-    error: process.env.NODE_ENV === 'development' ? error.message : undefined
-  });
-});
 
-// 404 handler - FIXED VERSION
-app.use((req, res, next) => {
-  res.status(404).json({ message: 'Endpoint not found' });
-});
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
