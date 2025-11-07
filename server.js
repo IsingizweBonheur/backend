@@ -327,31 +327,6 @@ app.post("/api/auth/validate-reset-token", async (req, res) => {
     });
   }
 });
-
-// FIXED: Improved middleware to verify user
-const verifyUser = async (req, res, next) => {
-  try {
-    const userId = req.headers['user-id'];
-    const userEmail = req.headers['user-email']
-    const { data: user, error } = await supabase
-      .from("users")
-      .select("id, email, username")
-      .eq("id", userId)
-      .eq("email", userEmail)
-      .single();
-
-    if (error || !user) {
-      return res.status(401).json({ message: "Invalid user credentials" });
-    }
-
-    req.user = user;
-    next();
-  } catch (error) {
-    console.error("Auth middleware error:", error);
-    return res.status(500).json({ message: "Authentication failed" });
-  }
-};
-
 // Get user profile (protected)
 app.get("/api/auth/profile", verifyUser, async (req, res) => {
   try {
