@@ -64,6 +64,43 @@ const cleanupExpiredTokens = () => {
 // Run cleanup every hour
 setInterval(cleanupExpiredTokens, 60 * 60 * 1000);
 
+// FIXED: Enhanced middleware to verify user using Supabase Auth
+const verifyUser = async (req, res, next) => {
+  try {
+    const authHeader = req.headers['authorization'];
+    
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ message: "Authentication token required" });
+    }
+
+    const token = authHeader.split(' ')[1];
+    
+    // Verify the token with Supabase
+    const { data: { user }, error } = await supabase.auth.getUser(token);
+
+    if (error || !user) {
+      return res.status(401).json({ message: "Invalid or expired token" });
+    }
+
+    // Check if user exists in our database
+    const { data: dbUser, error: dbError } = await supabase
+      .from("users")
+      .select("id, email, username")
+      .eq("email", user.email)
+      .single();
+
+    if (dbError || !dbUser) {
+      return res.status(401).json({ message: "User not found in database" });
+    }
+
+    req.user = dbUser;
+    next();
+  } catch (error) {
+    console.error("Auth middleware error:", error);
+    return res.status(500).json({ message: "Authentication failed" });
+  }
+};
+
 // User Registration Endpoint
 app.post("/api/auth/register", async (req, res) => {
   try {
@@ -327,35 +364,6 @@ app.post("/api/auth/validate-reset-token", async (req, res) => {
     });
   }
 });
-
-// FIXED: Improved middleware to verify user
-const verifyUser = async (req, res, next) => {
-  try {
-    const userId = req.headers['user-id'];
-    const userEmail = req.headers['user-email'];
-    
-    if (!userId || !userEmail) {
-      return res.status(401).json({ message: "Authentication headers missing" });
-    }
-
-    const { data: user, error } = await supabase
-      .from("users")
-      .select("id, email, username")
-      .eq("id", userId)
-      .eq("email", userEmail)
-      .single();
-
-    if (error || !user) {
-      return res.status(401).json({ message: "Invalid user credentials" });
-    }
-
-    req.user = user;
-    next();
-  } catch (error) {
-    console.error("Auth middleware error:", error);
-    return res.status(500).json({ message: "Authentication failed" });
-  }
-};
 
 // Get user profile (protected)
 app.get("/api/auth/profile", verifyUser, async (req, res) => {
