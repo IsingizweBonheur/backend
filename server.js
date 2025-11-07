@@ -13,7 +13,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Configure multer for memory storage (we'll upload directly to Supabase)
+// Configure multer for memory storage
 const storage = multer.memoryStorage();
 const upload = multer({ 
   storage: storage,
@@ -39,6 +39,54 @@ if (!supabaseUrl || !supabaseServiceKey) {
 }
 
 const supabase = createClient(supabaseUrl, supabaseServiceKey);
+
+// Initialize storage bucket on startup
+const initializeStorage = async () => {
+  try {
+    console.log('Initializing Supabase storage...');
+    
+    // Check if bucket exists
+    const { data: buckets, error: bucketsError } = await supabase.storage.listBuckets();
+    if (bucketsError) {
+      console.error('Error listing buckets:', bucketsError);
+      return;
+    }
+
+    const bucketExists = buckets.some(bucket => bucket.name === 'product-images');
+    
+    if (!bucketExists) {
+      console.log('Creating product-images bucket...');
+      const { data, error: createError } = await supabase.storage.createBucket('product-images', {
+        public: true,
+        fileSizeLimit: 5242880, // 5MB
+      });
+      
+      if (createError) {
+        console.error('Error creating bucket:', createError);
+      } else {
+        console.log('Bucket created successfully');
+      }
+    } else {
+      console.log('Bucket already exists');
+      
+      // Ensure bucket is public
+      const { error: updateError } = await supabase.storage.updateBucket('product-images', {
+        public: true
+      });
+      
+      if (updateError) {
+        console.error('Error updating bucket settings:', updateError);
+      } else {
+        console.log('Bucket set to public');
+      }
+    }
+  } catch (error) {
+    console.error('Storage initialization error:', error);
+  }
+};
+
+// Call initialization
+initializeStorage();
 
 // In-memory store for password reset tokens with automatic cleanup
 const passwordResetTokens = new Map();
@@ -330,6 +378,11 @@ const verifyUser = async (req, res, next) => {
   try {
     const userId = req.headers['user-id'];
     const userEmail = req.headers['user-email'];
+    
+    if (!userId || !userEmail) {
+      return res.status(401).json({ message: "Authentication headers missing" });
+    }
+
     const { data: user, error } = await supabase
       .from("users")
       .select("id, email, username")
@@ -337,8 +390,15 @@ const verifyUser = async (req, res, next) => {
       .eq("email", userEmail)
       .single();
 
+    if (error || !user) {
+      return res.status(401).json({ message: "Invalid user credentials" });
+    }
+
     req.user = user;
     next();
+  } catch (error) {
+    console.error("Verify user error:", error);
+    res.status(500).json({ message: "Authentication failed" });
   }
 };
 
@@ -382,6 +442,97 @@ app.put("/api/auth/profile", verifyUser, async (req, res) => {
   } catch (error) {
     console.error("Profile update error:", error);
     res.status(500).json({ message: "Failed to update profile" });
+  }
+});
+
+// FIXED: Upload image endpoint (protected) - Improved version
+app.post("/api/upload", verifyUser, upload.single('image'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ message: "No image file provided" });
+    }
+
+    const file = req.file;
+    const fileExtension = path.extname(file.originalname);
+    const fileName = `image-${Date.now()}-${Math.round(Math.random() * 1E9)}${fileExtension}`;
+    const filePath = fileName; // Store directly in bucket root, not in subfolder
+
+    console.log('Uploading file:', {
+      originalName: file.originalname,
+      fileName: fileName,
+      filePath: filePath,
+      mimetype: file.mimetype,
+      size: file.size
+    });
+
+    // Upload to Supabase Storage
+    const { data, error } = await supabase.storage
+      .from('product-images')
+      .upload(filePath, file.buffer, {
+        contentType: file.mimetype,
+        cacheControl: '3600',
+        upsert: false
+      });
+
+    if (error) {
+      console.error("Supabase storage upload error:", error);
+      return res.status(500).json({ 
+        message: "Failed to upload image to storage",
+        error: error.message 
+      });
+    }
+
+    console.log('Upload successful:', data);
+
+    // Get public URL for the uploaded image
+    const { data: { publicUrl } } = supabase.storage
+      .from('product-images')
+      .getPublicUrl(filePath);
+
+    console.log('Generated public URL:', publicUrl);
+
+    // Test if the image is accessible
+    try {
+      const testResponse = await fetch(publicUrl);
+      console.log('Image accessibility test:', testResponse.status);
+    } catch (fetchError) {
+      console.warn('Image accessibility test failed:', fetchError.message);
+    }
+
+    res.json({ 
+      message: "Image uploaded successfully", 
+      imageUrl: publicUrl,
+      filename: fileName,
+      filePath: filePath
+    });
+  } catch (error) {
+    console.error("Error uploading image:", error);
+    res.status(500).json({ 
+      message: "Failed to upload image", 
+      error: error.message 
+    });
+  }
+});
+
+// Delete uploaded image (protected)
+app.delete("/api/upload/:filename", verifyUser, async (req, res) => {
+  try {
+    const { filename } = req.params;
+    const filePath = filename; // Direct filename since we're storing in root
+
+    const { data, error } = await supabase.storage
+      .from('product-images')
+      .remove([filePath]);
+
+    if (error) {
+      console.error("Supabase storage delete error:", error);
+      return res.status(500).json({ message: "Failed to delete image from storage" });
+    }
+
+    res.json({ message: "Image deleted successfully" });
+  } catch (error) {
+    console.error("Error deleting image:", error);
+    res.status(500).json({ message: "Failed to delete image", error: error.message });
   }
 });
 
@@ -509,71 +660,6 @@ app.post("/api/orders", async (req, res) => {
   } catch (err) {
     console.error("Order creation error:", err);
     res.status(500).json({ message: "Failed to create order", error: err.message });
-  }
-});
-
-// UPDATED: Upload image endpoint (protected) - Now stores in Supabase Storage
-app.post("/api/upload", verifyUser, upload.single('image'), async (req, res) => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({ message: "No image file provided" });
-    }
-
-    const file = req.file;
-    const fileExtension = path.extname(file.originalname);
-    const fileName = `image-${Date.now()}-${Math.round(Math.random() * 1E9)}${fileExtension}`;
-    const filePath = `product-images/${fileName}`;
-
-    // Upload to Supabase Storage
-    const { data, error } = await supabase.storage
-      .from('product-images')
-      .upload(filePath, file.buffer, {
-        contentType: file.mimetype,
-        cacheControl: '3600',
-        upsert: false
-      });
-
-    if (error) {
-      console.error("Supabase storage upload error:", error);
-      return res.status(500).json({ message: "Failed to upload image to storage" });
-    }
-
-    // Get public URL for the uploaded image
-    const { data: { publicUrl } } = supabase.storage
-      .from('product-images')
-      .getPublicUrl(filePath);
-
-    res.json({ 
-      message: "Image uploaded successfully", 
-      imageUrl: publicUrl,
-      filename: fileName,
-      filePath: filePath
-    });
-  } catch (error) {
-    console.error("Error uploading image:", error);
-    res.status(500).json({ message: "Failed to upload image", error: error.message });
-  }
-});
-
-// UPDATED: Delete uploaded image (protected) - Now deletes from Supabase Storage
-app.delete("/api/upload/:filename", verifyUser, async (req, res) => {
-  try {
-    const { filename } = req.params;
-    const filePath = `product-images/${filename}`;
-
-    const { data, error } = await supabase.storage
-      .from('product-images')
-      .remove([filePath]);
-
-    if (error) {
-      console.error("Supabase storage delete error:", error);
-      return res.status(500).json({ message: "Failed to delete image from storage" });
-    }
-
-    res.json({ message: "Image deleted successfully" });
-  } catch (error) {
-    console.error("Error deleting image:", error);
-    res.status(500).json({ message: "Failed to delete image", error: error.message });
   }
 });
 
@@ -948,7 +1034,7 @@ app.get("/api/dashboard/stats", verifyUser, async (req, res) => {
   }
 });
 
-// UPDATED: Helper function to validate and clean image URL - Now handles Supabase URLs
+// Helper function to validate and clean image URL
 const validateImageUrl = (url) => {
   if (!url || url.trim() === '') {
     return null;
@@ -1084,6 +1170,39 @@ app.delete("/api/admins/:adminId", verifyUser, async (req, res) => {
   } catch (error) {
     console.error("Error deleting admin:", error);
     res.status(500).json({ message: "Failed to delete admin", error: error.message });
+  }
+});
+
+// Debug endpoint to check storage setup
+app.get("/api/debug/storage", verifyUser, async (req, res) => {
+  try {
+    // Check buckets
+    const { data: buckets, error: bucketsError } = await supabase.storage.listBuckets();
+    
+    // Check if we can list files in product-images bucket
+    const { data: files, error: filesError } = await supabase.storage
+      .from('product-images')
+      .list('', {
+        limit: 10,
+        offset: 0,
+      });
+
+    res.json({
+      buckets: buckets,
+      bucketError: bucketsError?.message,
+      files: files,
+      filesError: filesError?.message,
+      storageConfig: {
+        url: supabaseUrl,
+        hasServiceKey: !!supabaseServiceKey
+      }
+    });
+  } catch (error) {
+    console.error("Storage debug error:", error);
+    res.status(500).json({ 
+      message: "Debug failed", 
+      error: error.message 
+    });
   }
 });
 
