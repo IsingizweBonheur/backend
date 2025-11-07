@@ -13,22 +13,8 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// For Render deployment, use local uploads directory
-const uploadsDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
-}
-
-// Multer configuration for file uploads
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, uploadsDir);
-  },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
-  }
-});
+// For Render deployment - using memory storage for temporary file handling
+const storage = multer.memoryStorage(); // Store files in memory temporarily
 
 const fileFilter = (req, file, cb) => {
   if (file.mimetype.startsWith('image/')) {
@@ -56,9 +42,6 @@ if (!supabaseUrl || !supabaseServiceKey) {
 }
 
 const supabase = createClient(supabaseUrl, supabaseServiceKey);
-
-// Serve static files from uploads directory
-app.use('/uploads', express.static(uploadsDir));
 
 // In-memory store for password reset tokens with automatic cleanup
 const passwordResetTokens = new Map();
@@ -351,7 +334,9 @@ const verifyUser = async (req, res, next) => {
     const userId = req.headers['user-id'];
     const userEmail = req.headers['user-email'];
     
-  
+    if (!userId || !userEmail) {
+      return res.status(401).json({ message: "Authentication headers missing" });
+    }
 
     const { data: user, error } = await supabase
       .from("users")
@@ -360,7 +345,9 @@ const verifyUser = async (req, res, next) => {
       .eq("email", userEmail)
       .single();
 
-
+    if (error || !user) {
+      return res.status(401).json({ message: "Invalid user credentials" });
+    }
 
     req.user = user;
     next();
@@ -540,38 +527,66 @@ app.post("/api/orders", async (req, res) => {
   }
 });
 
-// Upload image endpoint (protected)
+// FIXED: Upload image endpoint using Supabase Storage
 app.post("/api/upload", verifyUser, upload.single('image'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ message: "No image file provided" });
     }
 
-    const imageUrl = `/uploads/${req.file.filename}`;
-    
+    // Generate unique filename
+    const fileExtension = path.extname(req.file.originalname);
+    const fileName = `image-${Date.now()}-${Math.round(Math.random() * 1E9)}${fileExtension}`;
+    const filePath = `products/${fileName}`;
+
+    // Upload to Supabase Storage
+    const { data, error } = await supabase.storage
+      .from('product-images') // Make sure this bucket exists in Supabase
+      .upload(filePath, req.file.buffer, {
+        contentType: req.file.mimetype,
+        upsert: false
+      });
+
+    if (error) {
+      console.error("Supabase storage upload error:", error);
+      return res.status(500).json({ message: "Failed to upload image to storage", error: error.message });
+    }
+
+    // Get public URL
+    const { data: { publicUrl } } = supabase.storage
+      .from('product-images')
+      .getPublicUrl(filePath);
+
+    console.log("Image uploaded successfully:", publicUrl);
+
     res.json({ 
       message: "Image uploaded successfully", 
-      imageUrl: imageUrl,
-      filename: req.file.filename
+      imageUrl: publicUrl,
+      filename: fileName
     });
+
   } catch (error) {
     console.error("Error uploading image:", error);
     res.status(500).json({ message: "Failed to upload image", error: error.message });
   }
 });
 
-// Delete uploaded image (protected)
+// FIXED: Delete uploaded image from Supabase Storage
 app.delete("/api/upload/:filename", verifyUser, async (req, res) => {
   try {
     const { filename } = req.params;
-    const filePath = path.join(__dirname, 'uploads', filename);
+    const filePath = `products/${filename}`;
 
-    if (fs.existsSync(filePath)) {
-      fs.unlinkSync(filePath);
-      res.json({ message: "Image deleted successfully" });
-    } else {
-      res.status(404).json({ message: "Image not found" });
+    const { error } = await supabase.storage
+      .from('product-images')
+      .remove([filePath]);
+
+    if (error) {
+      console.error("Supabase storage delete error:", error);
+      return res.status(500).json({ message: "Failed to delete image from storage" });
     }
+
+    res.json({ message: "Image deleted successfully" });
   } catch (error) {
     console.error("Error deleting image:", error);
     res.status(500).json({ message: "Failed to delete image", error: error.message });
