@@ -13,8 +13,22 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// For Render deployment - using memory storage for temporary file handling
-const storage = multer.memoryStorage(); // Store files in memory temporarily
+// For Render deployment, use local uploads directory
+const uploadsDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir, { recursive: true });
+}
+
+// Multer configuration for file uploads
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, uploadsDir);
+  },
+  filename: (req, file, cb) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
+  }
+});
 
 const fileFilter = (req, file, cb) => {
   if (file.mimetype.startsWith('image/')) {
@@ -43,6 +57,9 @@ if (!supabaseUrl || !supabaseServiceKey) {
 
 const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
+// Serve static files from uploads directory
+app.use('/uploads', express.static(uploadsDir));
+
 // In-memory store for password reset tokens with automatic cleanup
 const passwordResetTokens = new Map();
 
@@ -64,85 +81,6 @@ const cleanupExpiredTokens = () => {
 // Run cleanup every hour
 setInterval(cleanupExpiredTokens, 60 * 60 * 1000);
 
-// FIXED: Enhanced middleware to verify user - checks both users and admin_users tables
-const verifyUser = async (req, res, next) => {
-  try {
-    const authHeader = req.headers['authorization'];
-    
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ message: "Authentication token required" });
-    }
-
-    const token = authHeader.split(' ')[1];
-    
-    // First try to verify with Supabase Auth
-    const { data: { user }, error: authError } = await supabase.auth.getUser(token);
-
-    if (authError || !user) {
-      // If Supabase auth fails, try our database token system
-      console.log("Supabase auth failed, trying database authentication...");
-      
-      // Check if token exists in our users table (for backward compatibility)
-      const { data: dbUser, error: dbError } = await supabase
-        .from("users")
-        .select("id, email, username, phone, address")
-        .eq("id", token) // Using token as ID for simple verification
-        .single();
-
-      if (dbError || !dbUser) {
-        // Check admin_users table
-        const { data: adminUser, error: adminError } = await supabase
-          .from("admin_users")
-          .select("id, email, name as username, role")
-          .eq("id", token)
-          .single();
-
-        if (adminError || !adminUser) {
-          return res.status(401).json({ message: "Invalid or expired token" });
-        }
-
-        req.user = adminUser;
-        req.user.type = 'admin';
-      } else {
-        req.user = dbUser;
-        req.user.type = 'customer';
-      }
-    } else {
-      // Supabase auth successful - find user in our tables
-      const [userResult, adminResult] = await Promise.all([
-        supabase
-          .from("users")
-          .select("id, email, username, phone, address")
-          .eq("email", user.email)
-          .single(),
-        
-        supabase
-          .from("admin_users")
-          .select("id, email, name as username, role")
-          .eq("email", user.email)
-          .single()
-      ]);
-
-      if (userResult.data) {
-        req.user = userResult.data;
-        req.user.type = 'customer';
-      } else if (adminResult.data) {
-        req.user = adminResult.data;
-        req.user.type = 'admin';
-      } else {
-        console.error("User not found in database tables:", user.email);
-        return res.status(401).json({ message: "User not found in database" });
-      }
-    }
-
-    console.log("User authenticated:", { email: req.user.email, type: req.user.type });
-    next();
-  } catch (error) {
-    console.error("Auth middleware error:", error);
-    return res.status(500).json({ message: "Authentication failed" });
-  }
-};
-
 // User Registration Endpoint
 app.post("/api/auth/register", async (req, res) => {
   try {
@@ -156,22 +94,13 @@ app.post("/api/auth/register", async (req, res) => {
       return res.status(400).json({ message: "Password must be at least 6 characters" });
     }
 
-    // Check if user exists in either table
-    const [existingUser, existingAdmin] = await Promise.all([
-      supabase
-        .from("users")
-        .select("id")
-        .or(`email.eq.${email},username.eq.${username}`)
-        .single(),
-      
-      supabase
-        .from("admin_users")
-        .select("id")
-        .eq("email", email)
-        .single()
-    ]);
+    const { data: existingUser, error: checkError } = await supabase
+      .from("users")
+      .select("id")
+      .or(`email.eq.${email},username.eq.${username}`)
+      .single();
 
-    if (existingUser.data || existingAdmin.data) {
+    if (existingUser) {
       return res.status(400).json({ message: "User already exists with this email or username" });
     }
 
@@ -210,36 +139,14 @@ app.post("/api/auth/login", async (req, res) => {
       return res.status(400).json({ message: "Email and password are required" });
     }
 
-    // First try users table
-    const { data: user, error: userError } = await supabase
+    const { data: user, error } = await supabase
       .from("users")
       .select("*")
       .eq("email", email)
       .single();
 
-    if (userError || !user) {
-      // If not in users table, try admin_users table
-      const { data: adminUser, error: adminError } = await supabase
-        .from("admin_users")
-        .select("*")
-        .eq("email", email)
-        .single();
-
-      if (adminError || !adminUser) {
-        return res.status(401).json({ message: "Invalid credentials" });
-      }
-
-      const isAdminPasswordValid = await bcrypt.compare(password, adminUser.password);
-      if (!isAdminPasswordValid) {
-        return res.status(401).json({ message: "Invalid credentials" });
-      }
-
-      const { password: _, ...adminWithoutPassword } = adminUser;
-      res.json({ 
-        message: "Login successful", 
-        user: { ...adminWithoutPassword, type: 'admin' }
-      });
-      return;
+    if (error || !user) {
+      return res.status(401).json({ message: "Invalid credentials" });
     }
 
     const isPasswordValid = await bcrypt.compare(password, user.password);
@@ -248,9 +155,10 @@ app.post("/api/auth/login", async (req, res) => {
     }
 
     const { password: _, ...userWithoutPassword } = user;
+
     res.json({ 
       message: "Login successful", 
-      user: { ...userWithoutPassword, type: 'customer' }
+      user: userWithoutPassword 
     });
 
   } catch (error) {
@@ -268,24 +176,13 @@ app.post("/api/auth/check-email", async (req, res) => {
       return res.status(400).json({ message: "Email is required" });
     }
 
-    // Check both users and admin_users tables
-    const [userResult, adminResult] = await Promise.all([
-      supabase
-        .from("users")
-        .select("id, email, username")
-        .eq("email", email)
-        .single(),
-      
-      supabase
-        .from("admin_users")
-        .select("id, email, name as username")
-        .eq("email", email)
-        .single()
-    ]);
+    const { data: user, error } = await supabase
+      .from("users")
+      .select("id, email, username")
+      .eq("email", email)
+      .single();
 
-    const user = userResult.data || adminResult.data;
-
-    if (!user) {
+    if (error || !user) {
       return res.json({ 
         exists: false,
         message: "If an account with that email exists, a password reset link has been sent" 
@@ -315,24 +212,13 @@ app.post("/api/auth/forgot-password", async (req, res) => {
 
     cleanupExpiredTokens();
 
-    // Check both users and admin_users tables
-    const [userResult, adminResult] = await Promise.all([
-      supabase
-        .from("users")
-        .select("id, email, username")
-        .eq("email", email)
-        .single(),
-      
-      supabase
-        .from("admin_users")
-        .select("id, email, name as username")
-        .eq("email", email)
-        .single()
-    ]);
+    const { data: user, error } = await supabase
+      .from("users")
+      .select("id, email, username")
+      .eq("email", email)
+      .single();
 
-    const user = userResult.data || adminResult.data;
-
-    if (!user) {
+    if (error || !user) {
       return res.json({ 
         message: "If an account with that email exists, a password reset link has been sent" 
       });
@@ -345,8 +231,7 @@ app.post("/api/auth/forgot-password", async (req, res) => {
       userId: user.id,
       email: user.email,
       username: user.username,
-      expiresAt: tokenExpiry,
-      userType: userResult.data ? 'customer' : 'admin'
+      expiresAt: tokenExpiry
     });
 
     console.log(`Password reset token for ${email}: ${resetToken}`);
@@ -395,11 +280,8 @@ app.post("/api/auth/reset-password", async (req, res) => {
 
     const hashedPassword = await bcrypt.hash(newPassword, 12);
 
-    // Update password in the correct table based on user type
-    const tableName = tokenData.userType === 'admin' ? 'admin_users' : 'users';
-    
     const { error: updateError } = await supabase
-      .from(tableName)
+      .from("users")
       .update({ password: hashedPassword })
       .eq("id", tokenData.userId);
 
@@ -463,6 +345,31 @@ app.post("/api/auth/validate-reset-token", async (req, res) => {
   }
 });
 
+// FIXED: Improved middleware to verify user
+const verifyUser = async (req, res, next) => {
+  try {
+    const userId = req.headers['user-id'];
+    const userEmail = req.headers['user-email'];
+    
+  
+
+    const { data: user, error } = await supabase
+      .from("users")
+      .select("id, email, username")
+      .eq("id", userId)
+      .eq("email", userEmail)
+      .single();
+
+
+
+    req.user = user;
+    next();
+  } catch (error) {
+    console.error("Auth middleware error:", error);
+    return res.status(500).json({ message: "Authentication failed" });
+  }
+};
+
 // Get user profile (protected)
 app.get("/api/auth/profile", verifyUser, async (req, res) => {
   try {
@@ -478,7 +385,6 @@ app.put("/api/auth/profile", verifyUser, async (req, res) => {
   try {
     const { username, email, phone, address } = req.body;
     const userId = req.user.id;
-    const userType = req.user.type;
 
     const updateData = {};
     if (username) updateData.username = username;
@@ -486,14 +392,10 @@ app.put("/api/auth/profile", verifyUser, async (req, res) => {
     if (phone !== undefined) updateData.phone = phone;
     if (address !== undefined) updateData.address = address;
 
-    // Update in the correct table based on user type
-    const tableName = userType === 'admin' ? 'admin_users' : 'users';
-    const idField = userType === 'admin' ? 'id' : 'id';
-
     const { data: user, error } = await supabase
-      .from(tableName)
+      .from("users")
       .update(updateData)
-      .eq(idField, userId)
+      .eq("id", userId)
       .select()
       .single();
 
@@ -638,66 +540,38 @@ app.post("/api/orders", async (req, res) => {
   }
 });
 
-// FIXED: Upload image endpoint using Supabase Storage
+// Upload image endpoint (protected)
 app.post("/api/upload", verifyUser, upload.single('image'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ message: "No image file provided" });
     }
 
-    // Generate unique filename
-    const fileExtension = path.extname(req.file.originalname);
-    const fileName = `image-${Date.now()}-${Math.round(Math.random() * 1E9)}${fileExtension}`;
-    const filePath = `products/${fileName}`;
-
-    // Upload to Supabase Storage
-    const { data, error } = await supabase.storage
-      .from('product-images') // Make sure this bucket exists in Supabase
-      .upload(filePath, req.file.buffer, {
-        contentType: req.file.mimetype,
-        upsert: false
-      });
-
-    if (error) {
-      console.error("Supabase storage upload error:", error);
-      return res.status(500).json({ message: "Failed to upload image to storage", error: error.message });
-    }
-
-    // Get public URL
-    const { data: { publicUrl } } = supabase.storage
-      .from('product-images')
-      .getPublicUrl(filePath);
-
-    console.log("Image uploaded successfully:", publicUrl);
-
+    const imageUrl = `/uploads/${req.file.filename}`;
+    
     res.json({ 
       message: "Image uploaded successfully", 
-      imageUrl: publicUrl,
-      filename: fileName
+      imageUrl: imageUrl,
+      filename: req.file.filename
     });
-
   } catch (error) {
     console.error("Error uploading image:", error);
     res.status(500).json({ message: "Failed to upload image", error: error.message });
   }
 });
 
-// FIXED: Delete uploaded image from Supabase Storage
+// Delete uploaded image (protected)
 app.delete("/api/upload/:filename", verifyUser, async (req, res) => {
   try {
     const { filename } = req.params;
-    const filePath = `products/${filename}`;
+    const filePath = path.join(__dirname, 'uploads', filename);
 
-    const { error } = await supabase.storage
-      .from('product-images')
-      .remove([filePath]);
-
-    if (error) {
-      console.error("Supabase storage delete error:", error);
-      return res.status(500).json({ message: "Failed to delete image from storage" });
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+      res.json({ message: "Image deleted successfully" });
+    } else {
+      res.status(404).json({ message: "Image not found" });
     }
-
-    res.json({ message: "Image deleted successfully" });
   } catch (error) {
     console.error("Error deleting image:", error);
     res.status(500).json({ message: "Failed to delete image", error: error.message });
