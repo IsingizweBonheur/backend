@@ -332,12 +332,7 @@ app.post("/api/auth/validate-reset-token", async (req, res) => {
 const verifyUser = async (req, res, next) => {
   try {
     const userId = req.headers['user-id'];
-    const userEmail = req.headers['user-email'];
-    
-    if (!userId || !userEmail) {
-      return res.status(401).json({ message: "Authentication headers missing" });
-    }
-
+    const userEmail = req.headers['user-email']
     const { data: user, error } = await supabase
       .from("users")
       .select("id, email, username")
