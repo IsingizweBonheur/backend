@@ -330,21 +330,12 @@ const verifyUser = async (req, res, next) => {
   try {
     const userId = req.headers['user-id'];
     const userEmail = req.headers['user-email'];
-    
-    if (!userId || !userEmail) {
-      return res.status(401).json({ message: "Authentication required" });
-    }
-
     const { data: user, error } = await supabase
       .from("users")
       .select("id, email, username")
       .eq("id", userId)
       .eq("email", userEmail)
       .single();
-
-    if (error || !user) {
-      return res.status(401).json({ message: "Invalid authentication credentials" });
-    }
 
     req.user = user;
     next();
