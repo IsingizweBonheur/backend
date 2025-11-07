@@ -13,34 +13,17 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// For Render deployment, use local uploads directory
-const uploadsDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
-}
-
-// Multer configuration for file uploads
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, uploadsDir);
-  },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
-  }
-});
-
-const fileFilter = (req, file, cb) => {
-  if (file.mimetype.startsWith('image/')) {
-    cb(null, true);
-  } else {
-    cb(new Error('Only image files are allowed!'), false);
-  }
-};
-
+// Configure multer for memory storage (we'll upload directly to Supabase)
+const storage = multer.memoryStorage();
 const upload = multer({ 
   storage: storage,
-  fileFilter: fileFilter,
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype.startsWith('image/')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only image files are allowed!'), false);
+    }
+  },
   limits: {
     fileSize: 5 * 1024 * 1024, // 5MB limit
   }
@@ -56,9 +39,6 @@ if (!supabaseUrl || !supabaseServiceKey) {
 }
 
 const supabase = createClient(supabaseUrl, supabaseServiceKey);
-
-// Serve static files from uploads directory
-app.use('/uploads', express.static(uploadsDir));
 
 // In-memory store for password reset tokens with automatic cleanup
 const passwordResetTokens = new Map();
@@ -345,13 +325,15 @@ app.post("/api/auth/validate-reset-token", async (req, res) => {
   }
 });
 
-// FIXED: Improved middleware to verify user
+// Middleware to verify user
 const verifyUser = async (req, res, next) => {
   try {
     const userId = req.headers['user-id'];
     const userEmail = req.headers['user-email'];
     
-  
+    if (!userId || !userEmail) {
+      return res.status(401).json({ message: "Authentication required" });
+    }
 
     const { data: user, error } = await supabase
       .from("users")
@@ -360,7 +342,9 @@ const verifyUser = async (req, res, next) => {
       .eq("email", userEmail)
       .single();
 
-
+    if (error || !user) {
+      return res.status(401).json({ message: "Invalid authentication credentials" });
+    }
 
     req.user = user;
     next();
@@ -413,7 +397,7 @@ app.put("/api/auth/profile", verifyUser, async (req, res) => {
   }
 });
 
-// FIXED: User orders endpoint
+// User orders endpoint
 app.get("/api/orders/user", verifyUser, async (req, res) => {
   try {
     const user = req.user;
@@ -540,19 +524,42 @@ app.post("/api/orders", async (req, res) => {
   }
 });
 
-// Upload image endpoint (protected)
+// UPDATED: Upload image endpoint (protected) - Now stores in Supabase Storage
 app.post("/api/upload", verifyUser, upload.single('image'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ message: "No image file provided" });
     }
 
-    const imageUrl = `/uploads/${req.file.filename}`;
-    
+    const file = req.file;
+    const fileExtension = path.extname(file.originalname);
+    const fileName = `image-${Date.now()}-${Math.round(Math.random() * 1E9)}${fileExtension}`;
+    const filePath = `product-images/${fileName}`;
+
+    // Upload to Supabase Storage
+    const { data, error } = await supabase.storage
+      .from('product-images')
+      .upload(filePath, file.buffer, {
+        contentType: file.mimetype,
+        cacheControl: '3600',
+        upsert: false
+      });
+
+    if (error) {
+      console.error("Supabase storage upload error:", error);
+      return res.status(500).json({ message: "Failed to upload image to storage" });
+    }
+
+    // Get public URL for the uploaded image
+    const { data: { publicUrl } } = supabase.storage
+      .from('product-images')
+      .getPublicUrl(filePath);
+
     res.json({ 
       message: "Image uploaded successfully", 
-      imageUrl: imageUrl,
-      filename: req.file.filename
+      imageUrl: publicUrl,
+      filename: fileName,
+      filePath: filePath
     });
   } catch (error) {
     console.error("Error uploading image:", error);
@@ -560,25 +567,29 @@ app.post("/api/upload", verifyUser, upload.single('image'), async (req, res) => 
   }
 });
 
-// Delete uploaded image (protected)
+// UPDATED: Delete uploaded image (protected) - Now deletes from Supabase Storage
 app.delete("/api/upload/:filename", verifyUser, async (req, res) => {
   try {
     const { filename } = req.params;
-    const filePath = path.join(__dirname, 'uploads', filename);
+    const filePath = `product-images/${filename}`;
 
-    if (fs.existsSync(filePath)) {
-      fs.unlinkSync(filePath);
-      res.json({ message: "Image deleted successfully" });
-    } else {
-      res.status(404).json({ message: "Image not found" });
+    const { data, error } = await supabase.storage
+      .from('product-images')
+      .remove([filePath]);
+
+    if (error) {
+      console.error("Supabase storage delete error:", error);
+      return res.status(500).json({ message: "Failed to delete image from storage" });
     }
+
+    res.json({ message: "Image deleted successfully" });
   } catch (error) {
     console.error("Error deleting image:", error);
     res.status(500).json({ message: "Failed to delete image", error: error.message });
   }
 });
 
-// FIXED: Get all orders (protected) - Optimized
+// Get all orders (protected)
 app.get("/api/orders", verifyUser, async (req, res) => {
   try {
     console.log('Fetching all orders...');
@@ -604,7 +615,7 @@ app.get("/api/orders", verifyUser, async (req, res) => {
   }
 });
 
-// FIXED: Get order items (protected) - Optimized and Fixed
+// Get order items (protected)
 app.get("/api/orders/:orderId/items", verifyUser, async (req, res) => {
   try {
     const { orderId } = req.params;
@@ -662,7 +673,7 @@ app.get("/api/orders/:orderId/items", verifyUser, async (req, res) => {
   }
 });
 
-// FIXED: Update order status (protected) - Optimized and Fixed
+// Update order status (protected)
 app.put("/api/orders/:orderId", verifyUser, async (req, res) => {
   try {
     const { orderId } = req.params;
@@ -766,7 +777,7 @@ app.delete("/api/orders/:orderId", verifyUser, async (req, res) => {
   }
 });
 
-// Get all products (public) - Optimized
+// Get all products (public)
 app.get("/api/products", async (req, res) => {
   try {
     console.log('Fetching all products...');
@@ -898,7 +909,7 @@ app.delete("/api/products/:productId", verifyUser, async (req, res) => {
   }
 });
 
-// FIXED: Get dashboard stats (protected) - Optimized
+// Get dashboard stats (protected)
 app.get("/api/dashboard/stats", verifyUser, async (req, res) => {
   try {
     console.log('Fetching dashboard stats...');
@@ -949,13 +960,19 @@ app.get("/api/dashboard/stats", verifyUser, async (req, res) => {
   }
 });
 
-// Helper function to validate and clean image URL
+// UPDATED: Helper function to validate and clean image URL - Now handles Supabase URLs
 const validateImageUrl = (url) => {
   if (!url || url.trim() === '') {
     return null;
   }
   
-  if (url.startsWith('/uploads/')) {
+  // Allow Supabase storage URLs
+  if (url.includes('.supabase.co/storage/v1/object/public/product-images/')) {
+    return url;
+  }
+  
+  // Allow relative paths (for backward compatibility)
+  if (url.startsWith('/')) {
     return url;
   }
   
@@ -1147,4 +1164,5 @@ const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Health check: http://localhost:${PORT}/api/health`);
+  console.log('Images are now stored in Supabase Storage bucket: product-images');
 });
