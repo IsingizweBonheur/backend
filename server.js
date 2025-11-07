@@ -64,7 +64,7 @@ const cleanupExpiredTokens = () => {
 // Run cleanup every hour
 setInterval(cleanupExpiredTokens, 60 * 60 * 1000);
 
-// FIXED: Enhanced middleware to verify user using Supabase Auth
+// FIXED: Enhanced middleware to verify user - checks both users and admin_users tables
 const verifyUser = async (req, res, next) => {
   try {
     const authHeader = req.headers['authorization'];
@@ -75,25 +75,67 @@ const verifyUser = async (req, res, next) => {
 
     const token = authHeader.split(' ')[1];
     
-    // Verify the token with Supabase
-    const { data: { user }, error } = await supabase.auth.getUser(token);
+    // First try to verify with Supabase Auth
+    const { data: { user }, error: authError } = await supabase.auth.getUser(token);
 
-    if (error || !user) {
-      return res.status(401).json({ message: "Invalid or expired token" });
+    if (authError || !user) {
+      // If Supabase auth fails, try our database token system
+      console.log("Supabase auth failed, trying database authentication...");
+      
+      // Check if token exists in our users table (for backward compatibility)
+      const { data: dbUser, error: dbError } = await supabase
+        .from("users")
+        .select("id, email, username, phone, address")
+        .eq("id", token) // Using token as ID for simple verification
+        .single();
+
+      if (dbError || !dbUser) {
+        // Check admin_users table
+        const { data: adminUser, error: adminError } = await supabase
+          .from("admin_users")
+          .select("id, email, name as username, role")
+          .eq("id", token)
+          .single();
+
+        if (adminError || !adminUser) {
+          return res.status(401).json({ message: "Invalid or expired token" });
+        }
+
+        req.user = adminUser;
+        req.user.type = 'admin';
+      } else {
+        req.user = dbUser;
+        req.user.type = 'customer';
+      }
+    } else {
+      // Supabase auth successful - find user in our tables
+      const [userResult, adminResult] = await Promise.all([
+        supabase
+          .from("users")
+          .select("id, email, username, phone, address")
+          .eq("email", user.email)
+          .single(),
+        
+        supabase
+          .from("admin_users")
+          .select("id, email, name as username, role")
+          .eq("email", user.email)
+          .single()
+      ]);
+
+      if (userResult.data) {
+        req.user = userResult.data;
+        req.user.type = 'customer';
+      } else if (adminResult.data) {
+        req.user = adminResult.data;
+        req.user.type = 'admin';
+      } else {
+        console.error("User not found in database tables:", user.email);
+        return res.status(401).json({ message: "User not found in database" });
+      }
     }
 
-    // Check if user exists in our database
-    const { data: dbUser, error: dbError } = await supabase
-      .from("users")
-      .select("id, email, username")
-      .eq("email", user.email)
-      .single();
-
-    if (dbError || !dbUser) {
-      return res.status(401).json({ message: "User not found in database" });
-    }
-
-    req.user = dbUser;
+    console.log("User authenticated:", { email: req.user.email, type: req.user.type });
     next();
   } catch (error) {
     console.error("Auth middleware error:", error);
@@ -114,13 +156,22 @@ app.post("/api/auth/register", async (req, res) => {
       return res.status(400).json({ message: "Password must be at least 6 characters" });
     }
 
-    const { data: existingUser, error: checkError } = await supabase
-      .from("users")
-      .select("id")
-      .or(`email.eq.${email},username.eq.${username}`)
-      .single();
+    // Check if user exists in either table
+    const [existingUser, existingAdmin] = await Promise.all([
+      supabase
+        .from("users")
+        .select("id")
+        .or(`email.eq.${email},username.eq.${username}`)
+        .single(),
+      
+      supabase
+        .from("admin_users")
+        .select("id")
+        .eq("email", email)
+        .single()
+    ]);
 
-    if (existingUser) {
+    if (existingUser.data || existingAdmin.data) {
       return res.status(400).json({ message: "User already exists with this email or username" });
     }
 
@@ -159,14 +210,36 @@ app.post("/api/auth/login", async (req, res) => {
       return res.status(400).json({ message: "Email and password are required" });
     }
 
-    const { data: user, error } = await supabase
+    // First try users table
+    const { data: user, error: userError } = await supabase
       .from("users")
       .select("*")
       .eq("email", email)
       .single();
 
-    if (error || !user) {
-      return res.status(401).json({ message: "Invalid credentials" });
+    if (userError || !user) {
+      // If not in users table, try admin_users table
+      const { data: adminUser, error: adminError } = await supabase
+        .from("admin_users")
+        .select("*")
+        .eq("email", email)
+        .single();
+
+      if (adminError || !adminUser) {
+        return res.status(401).json({ message: "Invalid credentials" });
+      }
+
+      const isAdminPasswordValid = await bcrypt.compare(password, adminUser.password);
+      if (!isAdminPasswordValid) {
+        return res.status(401).json({ message: "Invalid credentials" });
+      }
+
+      const { password: _, ...adminWithoutPassword } = adminUser;
+      res.json({ 
+        message: "Login successful", 
+        user: { ...adminWithoutPassword, type: 'admin' }
+      });
+      return;
     }
 
     const isPasswordValid = await bcrypt.compare(password, user.password);
@@ -175,10 +248,9 @@ app.post("/api/auth/login", async (req, res) => {
     }
 
     const { password: _, ...userWithoutPassword } = user;
-
     res.json({ 
       message: "Login successful", 
-      user: userWithoutPassword 
+      user: { ...userWithoutPassword, type: 'customer' }
     });
 
   } catch (error) {
@@ -196,13 +268,24 @@ app.post("/api/auth/check-email", async (req, res) => {
       return res.status(400).json({ message: "Email is required" });
     }
 
-    const { data: user, error } = await supabase
-      .from("users")
-      .select("id, email, username")
-      .eq("email", email)
-      .single();
+    // Check both users and admin_users tables
+    const [userResult, adminResult] = await Promise.all([
+      supabase
+        .from("users")
+        .select("id, email, username")
+        .eq("email", email)
+        .single(),
+      
+      supabase
+        .from("admin_users")
+        .select("id, email, name as username")
+        .eq("email", email)
+        .single()
+    ]);
 
-    if (error || !user) {
+    const user = userResult.data || adminResult.data;
+
+    if (!user) {
       return res.json({ 
         exists: false,
         message: "If an account with that email exists, a password reset link has been sent" 
@@ -232,13 +315,24 @@ app.post("/api/auth/forgot-password", async (req, res) => {
 
     cleanupExpiredTokens();
 
-    const { data: user, error } = await supabase
-      .from("users")
-      .select("id, email, username")
-      .eq("email", email)
-      .single();
+    // Check both users and admin_users tables
+    const [userResult, adminResult] = await Promise.all([
+      supabase
+        .from("users")
+        .select("id, email, username")
+        .eq("email", email)
+        .single(),
+      
+      supabase
+        .from("admin_users")
+        .select("id, email, name as username")
+        .eq("email", email)
+        .single()
+    ]);
 
-    if (error || !user) {
+    const user = userResult.data || adminResult.data;
+
+    if (!user) {
       return res.json({ 
         message: "If an account with that email exists, a password reset link has been sent" 
       });
@@ -251,7 +345,8 @@ app.post("/api/auth/forgot-password", async (req, res) => {
       userId: user.id,
       email: user.email,
       username: user.username,
-      expiresAt: tokenExpiry
+      expiresAt: tokenExpiry,
+      userType: userResult.data ? 'customer' : 'admin'
     });
 
     console.log(`Password reset token for ${email}: ${resetToken}`);
@@ -300,8 +395,11 @@ app.post("/api/auth/reset-password", async (req, res) => {
 
     const hashedPassword = await bcrypt.hash(newPassword, 12);
 
+    // Update password in the correct table based on user type
+    const tableName = tokenData.userType === 'admin' ? 'admin_users' : 'users';
+    
     const { error: updateError } = await supabase
-      .from("users")
+      .from(tableName)
       .update({ password: hashedPassword })
       .eq("id", tokenData.userId);
 
@@ -380,6 +478,7 @@ app.put("/api/auth/profile", verifyUser, async (req, res) => {
   try {
     const { username, email, phone, address } = req.body;
     const userId = req.user.id;
+    const userType = req.user.type;
 
     const updateData = {};
     if (username) updateData.username = username;
@@ -387,10 +486,14 @@ app.put("/api/auth/profile", verifyUser, async (req, res) => {
     if (phone !== undefined) updateData.phone = phone;
     if (address !== undefined) updateData.address = address;
 
+    // Update in the correct table based on user type
+    const tableName = userType === 'admin' ? 'admin_users' : 'users';
+    const idField = userType === 'admin' ? 'id' : 'id';
+
     const { data: user, error } = await supabase
-      .from("users")
+      .from(tableName)
       .update(updateData)
-      .eq("id", userId)
+      .eq(idField, userId)
       .select()
       .single();
 
