@@ -390,10 +390,6 @@ const verifyUser = async (req, res, next) => {
       .eq("email", userEmail)
       .single();
 
-    if (error || !user) {
-      return res.status(401).json({ message: "Invalid user credentials" });
-    }
-
     req.user = user;
     next();
   } catch (error) {
