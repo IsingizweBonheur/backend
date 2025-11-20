@@ -390,6 +390,11 @@ const verifyUser = async (req, res, next) => {
       .eq("email", userEmail)
       .single();
 
+    if (error || !user) {
+      console.error('User verification failed:', error);
+      return res.status(401).json({ message: "Invalid user credentials" });
+    }
+
     req.user = user;
     next();
   } catch (error) {
@@ -451,7 +456,7 @@ app.post("/api/upload", verifyUser, upload.single('image'), async (req, res) => 
     const file = req.file;
     const fileExtension = path.extname(file.originalname);
     const fileName = `image-${Date.now()}-${Math.round(Math.random() * 1E9)}${fileExtension}`;
-    const filePath = fileName; // Store directly in bucket root, not in subfolder
+    const filePath = fileName;
 
     console.log('Uploading file:', {
       originalName: file.originalname,
@@ -487,14 +492,6 @@ app.post("/api/upload", verifyUser, upload.single('image'), async (req, res) => 
 
     console.log('Generated public URL:', publicUrl);
 
-    // Test if the image is accessible
-    try {
-      const testResponse = await fetch(publicUrl);
-      console.log('Image accessibility test:', testResponse.status);
-    } catch (fetchError) {
-      console.warn('Image accessibility test failed:', fetchError.message);
-    }
-
     res.json({ 
       message: "Image uploaded successfully", 
       imageUrl: publicUrl,
@@ -514,7 +511,7 @@ app.post("/api/upload", verifyUser, upload.single('image'), async (req, res) => 
 app.delete("/api/upload/:filename", verifyUser, async (req, res) => {
   try {
     const { filename } = req.params;
-    const filePath = filename; // Direct filename since we're storing in root
+    const filePath = filename;
 
     const { data, error } = await supabase.storage
       .from('product-images')
@@ -685,14 +682,41 @@ app.get("/api/orders", verifyUser, async (req, res) => {
   }
 });
 
-// Get order items (protected)
+// FIXED: Get order items (protected) - Added comprehensive error handling
 app.get("/api/orders/:orderId/items", verifyUser, async (req, res) => {
   try {
     const { orderId } = req.params;
     
     console.log(`Fetching items for order: ${orderId}`);
+    console.log('Authenticated user:', req.user);
 
-    const { data: items, error } = await supabase
+    // First, verify the order exists
+    const { data: order, error: orderError } = await supabase
+      .from("orders")
+      .select("id, customer_name, customer_email")
+      .eq("id", orderId)
+      .single();
+
+    if (orderError) {
+      console.error('Order not found:', orderError);
+      return res.status(404).json({ 
+        message: "Order not found",
+        error: orderError.message 
+      });
+    }
+
+    if (!order) {
+      console.error('Order does not exist:', orderId);
+      return res.status(404).json({ 
+        message: "Order not found",
+        orderId: orderId
+      });
+    }
+
+    console.log('Order found:', order);
+
+    // Then fetch order items with product details
+    const { data: items, error: itemsError } = await supabase
       .from("order_items")
       .select(`
         id,
@@ -709,36 +733,61 @@ app.get("/api/orders/:orderId/items", verifyUser, async (req, res) => {
       `)
       .eq('order_id', orderId);
 
-    if (error) {
-      console.error('Supabase items error:', error);
-      throw error;
+    if (itemsError) {
+      console.error('Supabase items error:', itemsError);
+      return res.status(500).json({ 
+        message: "Database error fetching order items",
+        error: itemsError.message 
+      });
     }
 
-    // Transform the data with proper field mapping
+    console.log(`Found ${items?.length || 0} raw items for order ${orderId}`);
+
+    // Safe transformation with error handling for each item
     const transformedItems = (items || []).map(item => {
-      // Use unit_price if available, otherwise use price or product total_amount
-      const unitPrice = item.unit_price || item.price || item.products?.total_amount || 0;
-      const quantity = item.quantity || 1;
-      
-      return {
-        id: item.id,
-        product_id: item.product_id,
-        product_name: item.products?.product_name || 'Unknown Product',
-        description: item.products?.description || '',
-        image_url: item.products?.image_url || '',
-        quantity: quantity,
-        unit_price: unitPrice,
-        total_amount: unitPrice * quantity
-      };
+      try {
+        // Safely extract product data with fallbacks
+        const productData = item.products || {};
+        const unitPrice = item.unit_price || item.price || productData.total_amount || 0;
+        const quantity = item.quantity || 1;
+        
+        return {
+          id: item.id,
+          product_id: item.product_id,
+          product_name: productData.product_name || 'Unknown Product',
+          description: productData.description || '',
+          image_url: productData.image_url || '',
+          quantity: quantity,
+          unit_price: unitPrice,
+          total_amount: unitPrice * quantity,
+          raw_item: process.env.NODE_ENV === 'development' ? item : undefined // Include for debugging
+        };
+      } catch (transformError) {
+        console.error('Error transforming item:', transformError, item);
+        return {
+          id: item.id,
+          product_id: item.product_id,
+          product_name: 'Error loading product',
+          description: '',
+          image_url: '',
+          quantity: item.quantity || 1,
+          unit_price: 0,
+          total_amount: 0,
+          error: 'Failed to process item data'
+        };
+      }
     });
 
-    console.log(`Transformed ${transformedItems.length} items for order ${orderId}`);
+    console.log(`Successfully transformed ${transformedItems.length} items for order ${orderId}`);
+    
     res.json(transformedItems);
+
   } catch (error) {
-    console.error("Error fetching order items:", error);
+    console.error("Unexpected error fetching order items:", error);
     res.status(500).json({ 
       message: "Failed to fetch order items", 
-      error: error.message 
+      error: error.message,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
     });
   }
 });
@@ -1218,14 +1267,26 @@ app.get("/api/debug/orders/:orderId", verifyUser, async (req, res) => {
       .eq("id", orderId)
       .single();
 
-    if (orderError) throw orderError;
+    if (orderError) {
+      console.error('Order fetch error:', orderError);
+      return res.status(404).json({ 
+        message: "Order not found",
+        error: orderError.message 
+      });
+    }
 
     const { data: items, error: itemsError } = await supabase
       .from("order_items")
       .select("*")
       .eq("order_id", orderId);
 
-    if (itemsError) throw itemsError;
+    if (itemsError) {
+      console.error('Items fetch error:', itemsError);
+      return res.status(500).json({ 
+        message: "Failed to fetch order items",
+        error: itemsError.message 
+      });
+    }
 
     res.json({
       order: order,
@@ -1241,6 +1302,40 @@ app.get("/api/debug/orders/:orderId", verifyUser, async (req, res) => {
       message: "Debug failed", 
       error: error.message 
     });
+  }
+});
+
+// Database health check endpoint
+app.get("/api/debug/database", verifyUser, async (req, res) => {
+  try {
+    // Test orders table
+    const { data: orders, error: ordersError } = await supabase
+      .from("orders")
+      .select("id")
+      .limit(1);
+    
+    // Test order_items table  
+    const { data: items, error: itemsError } = await supabase
+      .from("order_items")
+      .select("id")
+      .limit(1);
+
+    // Test products table
+    const { data: products, error: productsError } = await supabase
+      .from("products")
+      .select("id")
+      .limit(1);
+
+    res.json({
+      ordersTable: ordersError ? ordersError.message : "OK",
+      orderItemsTable: itemsError ? itemsError.message : "OK",
+      productsTable: productsError ? productsError.message : "OK",
+      ordersCount: orders?.length,
+      itemsCount: items?.length,
+      productsCount: products?.length
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 
