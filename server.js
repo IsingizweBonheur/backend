@@ -378,10 +378,6 @@ const verifyUser = async (req, res, next) => {
   try {
     const userId = req.headers['user-id'];
     const userEmail = req.headers['user-email'];
-    
-    if (!userId || !userEmail) {
-      return res.status(401).json({ message: "Authentication headers missing" });
-    }
 
     const { data: user, error } = await supabase
       .from("users")
@@ -685,7 +681,7 @@ app.get("/api/orders", verifyUser, async (req, res) => {
   }
 });
 
-// Get order items (protected)
+// Get order items (protected) - FIXED: removed unit_price references
 app.get("/api/orders/:orderId/items", verifyUser, async (req, res) => {
   try {
     const { orderId } = req.params;
@@ -699,7 +695,6 @@ app.get("/api/orders/:orderId/items", verifyUser, async (req, res) => {
         product_id,
         quantity,
         price,
-        unit_price,
         products:product_id (
           product_name,
           image_url,
@@ -714,10 +709,10 @@ app.get("/api/orders/:orderId/items", verifyUser, async (req, res) => {
       throw error;
     }
 
-    // Transform the data with proper field mapping
+    // Transform the data with proper field mapping - FIXED: removed unit_price reference
     const transformedItems = (items || []).map(item => {
-      // Use unit_price if available, otherwise use price or product total_amount
-      const unitPrice = item.unit_price || item.price || item.products?.total_amount || 0;
+      // Use the price field directly from order_items
+      const unitPrice = item.price || item.products?.total_amount || 0;
       const quantity = item.quantity || 1;
       
       return {
@@ -727,7 +722,7 @@ app.get("/api/orders/:orderId/items", verifyUser, async (req, res) => {
         description: item.products?.description || '',
         image_url: item.products?.image_url || '',
         quantity: quantity,
-        unit_price: unitPrice,
+        unit_price: unitPrice, // This is now just for the response, calculated from existing fields
         total_amount: unitPrice * quantity
       };
     });
@@ -1263,7 +1258,7 @@ app.use((error, req, res, next) => {
   });
 });
 
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Health check: http://localhost:${PORT}/api/health`);
